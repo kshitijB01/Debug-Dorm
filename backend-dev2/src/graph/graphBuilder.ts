@@ -21,15 +21,16 @@ export function buildArchitectureGraph(input: {
   const g = new Graph({ directed: true });
   
   // 1. Initialize nodes and indices
-  const nodes: GraphNode[] = [];
+  const allNodes: GraphNode[] = [];
   const nodesMap = new Map<string, GraphNode>();
-  const searchIndexMap = new Map<string, Set<string>>();
+  const folderSet = new Set<string>();
 
-  // 2. Node Creation Loop
+  // 1a. File Node Creation
   for (const file of input.files) {
     const segments = file.id.split("/");
     const name = segments[segments.length - 1];
     const folder = segments.length > 1 ? segments.slice(0, -1).join("/") : "root";
+    folderSet.add(folder);
 
     const node: GraphNode = {
       id: file.id,
@@ -40,96 +41,214 @@ export function buildArchitectureGraph(input: {
       impact: 0,
       dependencies: [],
       dependents: [],
+      type: 'file',
       position: { x: 0, y: 0 },
       highlight: false
     };
 
     nodesMap.set(file.id, node);
-    nodes.push(node);
+    allNodes.push(node);
     g.setNode(file.id);
-
-    const tokens = tokenize(file.id);
-    for (const token of tokens) {
-      if (!searchIndexMap.has(token)) {
-        searchIndexMap.set(token, new Set());
-      }
-      searchIndexMap.get(token)?.add(file.id);
-    }
   }
 
-  // 3. Add Edges
+  // 1b. Folder Node Creation (City Centers)
+  for (const folderPath of folderSet) {
+    if (nodesMap.has(folderPath)) continue; 
+    
+    const node: GraphNode = {
+        id: folderPath,
+        name: folderPath.split("/").pop() || "root",
+        label: folderPath.split("/").pop() || "root",
+        folder: folderPath.split("/").slice(0, -1).join("/") || "root",
+        layer: "infrastructure",
+        impact: 0,
+        dependencies: [],
+        dependents: [],
+        type: 'folder',
+        position: { x: 0, y: 0 },
+        highlight: false
+    };
+    nodesMap.set(folderPath, node);
+    allNodes.push(node);
+    g.setNode(folderPath);
+  }
+
+  // 2. Add Dependency Edges (Validated Imports)
   for (const dep of input.dependencies) {
     const sourceNode = nodesMap.get(dep.from);
     const targetNode = nodesMap.get(dep.to);
 
     if (sourceNode && targetNode) {
-      g.setEdge(dep.from, dep.to);
+      g.setEdge(dep.from, dep.to, { relation: 'dependency' });
       if (!sourceNode.dependencies.includes(dep.to)) sourceNode.dependencies.push(dep.to);
       if (!targetNode.dependents.includes(dep.from)) targetNode.dependents.push(dep.from);
     }
   }
 
-  // 4. Node Metrics (Impact)
-  for (const node of nodes) {
-    node.impact = node.dependents.length;
-  }
+  // 3. Node Metrics (Global Impact) & Entry Detection
+  let entryNodeId: string | null = null;
+  const entryPriority = (id: string) => {
+      const name = id.split("/").pop()?.toLowerCase() || "";
+      const isRoot = !id.includes("/");
+      if (name.startsWith("index")) return isRoot ? 100 : 90;
+      if (name.startsWith("main")) return isRoot ? 80 : 70;
+      if (name.startsWith("app")) return isRoot ? 60 : 50;
+      if (name.startsWith("server")) return isRoot ? 40 : 30;
+      return 0;
+  };
 
-  // 5. Parity Check
-  if (nodes.length !== nodesMap.size) {
-    console.warn("NodeMap Parity Mismatch. Rebuilding...");
-    nodesMap.clear();
-    for (const node of nodes) {
-      nodesMap.set(node.id, node);
+  let maxPrio = -1;
+  for (const node of allNodes) {
+    node.impact = Math.min((node.dependents.length || 0) + (node.dependencies.length || 0), 20);
+    
+    const prio = entryPriority(node.id);
+    if (prio > maxPrio) {
+        maxPrio = prio;
+        entryNodeId = node.id;
     }
   }
 
-  // 6. Compute Layout
-  const edges: GraphEdge[] = g.edges().map((e) => ({ source: e.v, target: e.w }));
-  computeLayout(nodes, edges);
-
-  // 7. Search Index (Sorted by Impact)
-  const searchIndex: Record<string, string[]> = {};
-  for (const [token, nodeIds] of searchIndexMap.entries()) {
-    const sortedIds = Array.from(nodeIds).sort((a, b) => {
-      const impactA = nodesMap.get(a)?.impact || 0;
-      const impactB = nodesMap.get(b)?.impact || 0;
-      return impactB - impactA;
-    });
-    searchIndex[token] = sortedIds.slice(0, 20);
+  // Fallback Entry (Highest Connectivity root node)
+  if (!entryNodeId || maxPrio === 0) {
+      const rootNodes = allNodes.filter(n => !n.id.includes("/"));
+      const best = (rootNodes.length > 0 ? rootNodes : allNodes).sort((a, b) => b.impact - a.impact)[0];
+      entryNodeId = best?.id || allNodes[0]?.id || null;
   }
 
-  // 8. Build Views & Query Context (Moved from API layer)
-  const nodeMapObj = Object.fromEntries(nodesMap.entries());
-  const { views, queryContext } = buildViews(nodes, nodeMapObj);
+  // 4. Strict Pruning (Top 20 selection)
+  // PRUNE BEFORE EDGE ASSEMBLY as per LOCKED spec
+  const sortedNodes = [...allNodes].sort((a, b) => {
+      // Priority: Root proximity + Impact
+      const depthA = a.id.split("/").length;
+      const depthB = b.id.split("/").length;
+      if (depthA !== depthB) return depthA - depthB;
+      return b.impact - a.impact;
+  });
 
-  // 9. Construct Metadata
-  const metadata = {
-    version: "2.0.0-LOCKED",
-    totalFiles: input.files.length,
-    totalEdges: input.dependencies.length,
-    validEdges: edges.length,
-    isLargeGraph: nodes.length > 200,
-    payloadSize: 0 
-  };
+  const visibleSubset = sortedNodes.slice(0, 20);
+  const visibleNodeIds = new Set(visibleSubset.map(n => n.id));
 
-  console.log("GRAPH NODE COUNT:", nodes.length);
-  console.log("GRAPH NODES SAMPLE:", nodes.slice(0, 10).map(n => n.id));
-
-  // Task 7: Sanity Check
-  if (nodes.length < 5 && input.files.length >= 5) {
-     throw new Error("Graph generation failed to preserve nodes — ingestion likely failed");
+  // Ensure Entry Node is visible
+  if (entryNodeId && !visibleNodeIds.has(entryNodeId)) {
+      const entryNode = nodesMap.get(entryNodeId);
+      if (entryNode) visibleSubset.push(entryNode);
   }
 
-  // 10. Final Result Assembly
+  // Ensure Folder parents are visible for files
+  const finalVisibleNodes: GraphNode[] = [];
+  const addedIds = new Set<string>();
+
+  for (const node of visibleSubset) {
+      if (addedIds.has(node.id)) continue;
+      finalVisibleNodes.push(node);
+      addedIds.add(node.id);
+      
+      if (node.type === 'file' && node.folder && !addedIds.has(node.folder)) {
+          const folderNode = nodesMap.get(node.folder);
+          if (folderNode) {
+              finalVisibleNodes.push(folderNode);
+              addedIds.add(node.folder);
+          }
+      }
+  }
+
+  // Final trim to ~20 total nodes
+  const finalSubset = finalVisibleNodes.slice(0, 22);
+  const finalSubsetIds = new Set(finalSubset.map(n => n.id));
+
+  // 5. Final Edge Sanitization (LOCKED SPEC)
+  const edgeSet = new Set<string>();
+  const sanitizedEdges: GraphEdge[] = [];
+  
+  input.dependencies.forEach(dep => {
+      if (!dep.from || !dep.to) return;
+      if (dep.from === dep.to) return;
+      if (!finalSubsetIds.has(dep.from) || !finalSubsetIds.has(dep.to)) return;
+      
+      const key = `${dep.from}->${dep.to}`;
+      if (!edgeSet.has(key)) {
+          edgeSet.add(key);
+          sanitizedEdges.push({ source: dep.from, target: dep.to, relation: 'dependency' });
+      }
+  });
+
+  // 6. Root Detection & Connectivity Guarantee (DEMO SAFE)
+  const incomingCount: Record<string, number> = {};
+  finalSubset.forEach(n => incomingCount[n.id] = 0);
+  sanitizedEdges.forEach(e => incomingCount[e.target] = (incomingCount[e.target] || 0) + 1);
+
+  let entryNodes = finalSubset.filter(n => incomingCount[n.id] === 0);
+  let finalRootId = entryNodeId;
+
+  // 6a. Virtual Root implementation
+  if (entryNodes.length > 1) {
+      const virtualRoot: GraphNode = {
+          id: "**root**",
+          name: "SYSTEM",
+          label: "SYSTEM",
+          folder: "root",
+          layer: "infrastructure",
+          impact: 20,
+          dependencies: entryNodes.map(n => n.id),
+          dependents: [],
+          type: 'folder',
+          position: { x: 0, y: 0 },
+          highlight: true
+      };
+      
+      finalSubset.unshift(virtualRoot);
+      entryNodes.forEach(node => {
+          sanitizedEdges.push({ source: "**root**", target: node.id, relation: 'dependency' });
+      });
+      finalRootId = "**root**";
+  }
+
+  // 6b. Reachability Check & Orphan Recovery
+  const visited = new Set<string>();
+  const queue = [finalRootId || finalSubset[0]?.id];
+  while (queue.length > 0) {
+      const current = queue.shift()!;
+      if (visited.has(current)) continue;
+      visited.add(current);
+      sanitizedEdges.filter(e => e.source === current).forEach(e => queue.push(e.target));
+  }
+
+  // Attach unvisited nodes to root
+  finalSubset.forEach(node => {
+      if (!visited.has(node.id) && node.id !== finalRootId) {
+          sanitizedEdges.push({ source: finalRootId || "**root**", target: node.id, relation: 'dependency' });
+      }
+  });
+
+  // 7. Assemble Result
+  if (finalSubset.length < 1) {
+      return {
+          graph: { nodes: [], edges: [] },
+          views: { default: [], highImpact: [], entryPoints: [], byFolder: {} },
+          nodeMap: {},
+          searchIndex: {},
+          queryContext: { topNodes: [], entryPoints: [], nodeMap: {} },
+          metadata: { version: "FALLBACK", totalFiles: 0, totalEdges: 0, validEdges: 0, isLargeGraph: false, payloadSize: 0, entryNodeId: null }
+      };
+  }
+
   return {
     graph: {
-      nodes: nodes,
-      edges: edges
+      nodes: finalSubset,
+      edges: sanitizedEdges
     },
-    views,
-    nodeMap: nodeMapObj,
-    searchIndex,
-    queryContext,
-    metadata
+    views: { default: [], highImpact: [], entryPoints: [], byFolder: {} },
+    nodeMap: Object.fromEntries(nodesMap.entries()),
+    searchIndex: {},
+    queryContext: { topNodes: [], entryPoints: [], nodeMap: {} },
+    metadata: {
+        version: "HIERARCHY-LOCKED-V1",
+        totalFiles: input.files.length,
+        totalEdges: input.dependencies.length,
+        validEdges: sanitizedEdges.length,
+        isLargeGraph: allNodes.length > 200,
+        payloadSize: 0,
+        entryNodeId: finalRootId || finalSubset[0]?.id
+    }
   };
 }

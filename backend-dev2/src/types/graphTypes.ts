@@ -23,6 +23,7 @@ export type GraphNode = {
   impact: number;
   dependencies: string[];
   dependents: string[];
+  type: 'file' | 'folder';
   position: { x: number; y: number };
   highlight: boolean;
 };
@@ -30,6 +31,7 @@ export type GraphNode = {
 export type GraphEdge = {
   source: string;
   target: string;
+  relation?: 'hierarchy' | 'dependency';
 };
 
 export type GraphViews = {
@@ -61,6 +63,7 @@ export type AnalysisResult = {
     validEdges: number;
     isLargeGraph: boolean;
     payloadSize: number;
+    entryNodeId: string | null;
   };
 };
 

@@ -6,11 +6,9 @@
   font-family: 'Inter', system-ui, Avenir, Helvetica, Arial, sans-serif;
   line-height: 1.5;
   font-weight: 400;
-
   color-scheme: dark;
   color: rgba(255, 255, 255, 0.87);
   background-color: transparent;
-
   font-synthesis: none;
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
@@ -21,111 +19,44 @@ body {
   margin: 0;
   min-width: 320px;
   min-height: 100vh;
-  background: linear-gradient(
-    120deg,
-    #000000,
-    #0a0a1a,
-    #111133,
-    #000000
-  );
-  background-size: 300% 300%;
-  animation: gradientMove 14s ease infinite;
+  background-color: #070711;
   color: white;
   overflow-x: hidden;
   position: relative;
 }
 
-/* Layer 1 - AI Field */
-body::before {
-  content: "";
-  position: fixed;
-  top: -20%;
-  left: -20%;
-  width: 140%;
-  height: 140%;
-  background: radial-gradient(
-    circle at 30% 30%,
-    rgba(99, 102, 241, 0.10),
-    transparent 60%
-  );
-  animation: glowMove1 16s ease-in-out infinite alternate;
-  filter: blur(100px);
-  z-index: -1;
-  pointer-events: none;
+/* ── Animations ─────────────────────────────────────────────── */
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to   { transform: rotate(360deg); }
 }
 
-/* Layer 2 - AI Field */
-body::after {
-  content: "";
-  position: fixed;
-  bottom: -20%;
-  right: -20%;
-  width: 140%;
-  height: 140%;
-  background: radial-gradient(
-    circle at 70% 70%,
-    rgba(168, 85, 247, 0.08),
-    transparent 60%
-  );
-  animation: glowMove2 18s ease-in-out infinite alternate;
-  filter: blur(100px);
-  z-index: -1;
-  pointer-events: none;
+@keyframes slideIn {
+  from { transform: translateX(100%); opacity: 0; }
+  to   { transform: translateX(0);    opacity: 1; }
 }
 
-#root {
-  width: 100%;
-  background: transparent !important;
+.animate-spin-slow { animation: spin 3s linear infinite; }
+.animate-slide-in  { animation: slideIn 0.45s cubic-bezier(0.16, 1, 0.3, 1) forwards; }
+
+/* ── ReactFlow overrides ────────────────────────────────────── */
+.react-flow__node {
+  border-radius: 12px !important;
 }
 
-@keyframes gradientMove {
-  0% { background-position: 0% 50%; }
-  50% { background-position: 100% 50%; }
-  100% { background-position: 0% 50%; }
+.react-flow__controls button {
+  background: rgba(0,0,0,0.8) !important;
+  border-color: rgba(255,255,255,0.1) !important;
+  color: rgba(255,255,255,0.6) !important;
 }
 
-@keyframes glowMove1 {
-  0% { transform: translate(0, 0); }
-  100% { transform: translate(80px, 50px); }
+.react-flow__controls button:hover {
+  background: rgba(99,102,241,0.2) !important;
 }
 
-@keyframes glowMove2 {
-  0% { transform: translate(0, 0); }
-  100% { transform: translate(-60px, -40px); }
-}
+/* ── Custom scrollbar ───────────────────────────────────────── */
+::-webkit-scrollbar { width: 5px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.06); border-radius: 10px; }
+::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.12); }
 
-@keyframes entranceFadeUp {
-  from {
-    opacity: 0;
-    transform: translateY(24px);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0);
-  }
-}
-
-.animate-entrance {
-  animation: entranceFadeUp 0.8s cubic-bezier(0.16, 1, 0.3, 1) forwards;
-}
-
-/* Delay Utilites */
-.delay-100 { animation-delay: 0.1s; }
-.delay-200 { animation-delay: 0.2s; }
-.delay-300 { animation-delay: 0.3s; }
-.delay-400 { animation-delay: 0.4s; }
-
-/* Custom scrollbar to match theme */
-::-webkit-scrollbar {
-  width: 8px;
-}
-::-webkit-scrollbar-track {
-  background: rgba(0, 0, 0, 0.2);
-}
-::-webkit-scrollbar-thumb {
-  background: rgba(255, 255, 255, 0.1);
-  border-radius: 10px;
-}
-::-webkit-scrollbar-thumb:hover {
-  background: rgba(255, 255, 255, 0.2);
-}

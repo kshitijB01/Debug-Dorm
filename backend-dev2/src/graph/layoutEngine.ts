@@ -16,23 +16,25 @@ export const computeLayout = (nodes: GraphNode[], edges: GraphEdge[]) => {
   
   // Set fixed configuration
   g.setGraph({
-    rankdir: "LR",
-    nodesep: 50,
-    ranksep: 100,
-    marginx: 20,
-    marginy: 20
+    rankdir: "TB",
+    nodesep: 150,
+    ranksep: 200,
+    marginx: 50,
+    marginy: 50
   });
   
   g.setDefaultEdgeLabel(() => ({}));
 
   // Add nodes
   for (const node of nodes) {
-    g.setNode(node.id, { width: 180, height: 40 });
+    g.setNode(node.id, { width: 220, height: 60 });
   }
 
-  // Add edges
+  // Add edges (Only hierarchy edges for layout)
   for (const edge of edges) {
-    g.setEdge(edge.source, edge.target);
+    if (edge.relation === 'hierarchy') {
+      g.setEdge(edge.source, edge.target);
+    }
   }
 
   // Compute layout

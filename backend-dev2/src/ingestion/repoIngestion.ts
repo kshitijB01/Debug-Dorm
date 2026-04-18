@@ -10,6 +10,71 @@ export type IngestionOutput = {
   dependencies: DependencyInput[];
 };
 
+// ---------------------------------------------------------------------------
+// Resilience & Security Hardening
+// ---------------------------------------------------------------------------
+
+let rateLimited = false;
+
+console.log("GitHub Auth:", process.env.GITHUB_TOKEN ? "ENABLED" : "DISABLED");
+
+/**
+ * Returns authenticated headers with a graceful fallback for unauthenticated requests.
+ */
+function getGitHubHeaders() {
+  const token = process.env.GITHUB_TOKEN;
+  if (token) {
+    return {
+      Authorization: `Bearer ${token}`,
+      Accept: "application/vnd.github+json"
+    };
+  }
+  console.warn("⚠️ No GitHub token found — using unauthenticated requests (Rate limits will be strict)");
+  return {
+    Accept: "application/vnd.github+json"
+  };
+}
+
+/**
+ * Perform a fetch with automatic retry logic and circuit-breaker rate limit protection.
+ */
+async function fetchWithRetry(url: string, options: any, retries = 2): Promise<Response> {
+  if (rateLimited) {
+    throw new Error("Temporarily rate-limited. Try again shortly.");
+  }
+
+  try {
+    const res = await fetch(url, options);
+
+    if (res.status === 403 || res.status === 429) {
+      rateLimited = true;
+      console.warn("⚠️ GitHub rate limit hit");
+
+      if (retries > 0) {
+        console.warn(`Rate limited — retrying in 500ms... (${retries} retries left)`);
+        await new Promise(r => setTimeout(r, 500));
+        return fetchWithRetry(url, options, retries - 1);
+      }
+      throw new Error("GitHub rate limit exceeded. Try again later.");
+    }
+
+    if (!res.ok) {
+      throw new Error(`GitHub API error: ${res.status} ${res.statusText}`);
+    }
+
+    // Success — reset rate limit flag
+    rateLimited = false;
+    return res;
+  } catch (err: any) {
+    if (retries > 0 && !err.message.includes("rate limit")) {
+      console.warn(`Retrying fetch due to error: ${err.message}...`);
+      await new Promise(r => setTimeout(r, 300));
+      return fetchWithRetry(url, options, retries - 1);
+    }
+    throw err;
+  }
+}
+
 /**
  * Extracts owner and repo from a GitHub URL.
  */
@@ -29,14 +94,7 @@ function parseGitHubUrl(url: string): { owner: string; repo: string } | null {
  */
 async function getRepoMetadata(owner: string, repo: string): Promise<string> {
   const url = `https://api.github.com/repos/${owner}/${repo}`;
-  const headers: Record<string, string> = {};
-  if (process.env.GITHUB_TOKEN) {
-    headers["Authorization"] = `Bearer ${process.env.GITHUB_TOKEN}`;
-  }
-
-  const response = await fetch(url, { headers });
-  if (!response.ok) throw new Error(`GitHub Metadata API failed: ${response.statusText}`);
-  
+  const response = await fetchWithRetry(url, { headers: getGitHubHeaders() });
   const data: any = await response.json();
   return data.default_branch || "main";
 }
@@ -57,27 +115,25 @@ function getPriority(path: string): number {
  */
 async function fetchGitHubTree(owner: string, repo: string, branch: string): Promise<FileInput[]> {
   const url = `https://api.github.com/repos/${owner}/${repo}/git/trees/${branch}?recursive=1`;
-  const headers: Record<string, string> = {};
-  if (process.env.GITHUB_TOKEN) {
-    headers["Authorization"] = `Bearer ${process.env.GITHUB_TOKEN}`;
-  }
-
-  const response = await fetch(url, { headers });
-  if (!response.ok) throw new Error(`GitHub Tree API failed: ${response.statusText}`);
-  
+  const response = await fetchWithRetry(url, { headers: getGitHubHeaders() });
   const data: any = await response.json();
+  
   if (data.truncated) {
     console.warn("[Ingestion] TREE TRUNCATED — processing available results only.");
   }
   console.log("TOTAL FILES FROM GITHUB:", data.tree.length);
   console.log("TRUNCATED:", !!data.truncated);
 
-  // 1. Filter: ONLY Blobs, exclude build artifacts and blacklisted patterns
+  // 1. Filter: ONLY Blobs, specific extensions, exclude build artifacts
+  const includedExtensions = new Set(['.js', '.ts', '.jsx', '.tsx', '.py']);
   const excludedPatterns = [/node_modules\//, /\.git\//, /dist\//, /build\//, /\.png$/, /\.jpg$/, /\.jpeg$/, /\.gif$/, /\.pdf$/, /\.zip$/];
   
   let rawFiles = data.tree
     .filter((item: any) => item.type === "blob")
-    .filter((item: any) => !excludedPatterns.some(p => p.test(item.path)));
+    .filter((item: any) => {
+        const ext = `.${item.path.split('.').pop()}`;
+        return includedExtensions.has(ext) && !excludedPatterns.some(p => p.test(item.path));
+    });
 
   // 2. Clean Paths
   rawFiles = rawFiles.map((f: any) => ({
@@ -85,7 +141,7 @@ async function fetchGitHubTree(owner: string, repo: string, branch: string): Pro
     path: f.path.replace(/\\/g, "/")
   }));
 
-  // 3. Deduplicate (just in case)
+  // 3. Deduplicate
   const dedupMap = new Map();
   for (const f of rawFiles) {
     dedupMap.set(f.path, f);
@@ -93,24 +149,117 @@ async function fetchGitHubTree(owner: string, repo: string, branch: string): Pro
   let uniqueFiles = Array.from(dedupMap.values());
 
   // 4. Smart Sampling (Priority Sort)
-  uniqueFiles.sort((a, b) => getPriority(b.path) - getPriority(a.path));
+  uniqueNodesSort(uniqueFiles);
 
-  // Limit to 1500
-  const finalSubset = uniqueFiles.slice(0, 1500);
+  // Limit to 300 for structural map, but only fetch content for top 100 for routes
+  const filesToFetch = uniqueFiles.slice(0, 80);
+  const remainingFiles = uniqueFiles.slice(80, 200);
 
-  const uniqueFolders = new Set(finalSubset.map(f => {
-    const parts = f.path.split("/");
-    return parts.length > 1 ? parts.slice(0, -1).join("/") : "root";
+  // 5. Fetch Content for Top Files (with batching)
+  const fileInputs: FileInput[] = await Promise.all(
+    filesToFetch.map(async (f: any) => {
+        try {
+            const content = await fetchFileContent(owner, repo, f.sha);
+            return {
+                id: f.path,
+                content: content,
+                extension: "." + f.path.split(".").pop()
+            };
+        } catch (e) {
+            return { id: f.path, content: "", extension: "." + f.path.split(".").pop() };
+        }
+    })
+  );
+
+  const fallbackInputs: FileInput[] = remainingFiles.map(f => ({
+      id: f.path,
+      content: "",
+      extension: "." + f.path.split(".").pop()
   }));
-  console.log("FOLDER COUNT:", uniqueFolders.size);
-  console.log("VALID FILES:", finalSubset.length);
-  console.log("SAMPLE PATHS:", finalSubset.slice(0, 5).map(f => f.path));
 
-  return finalSubset.map(f => ({
-    id: f.path,
-    content: "", // We only map architecture, not content currently
-    extension: "." + f.path.split(".").pop()
-  }));
+  return [...fileInputs, ...fallbackInputs];
+}
+
+async function fetchFileContent(owner: string, repo: string, sha: string): Promise<string> {
+    const url = `https://api.github.com/repos/${owner}/${repo}/git/blobs/${sha}`;
+    const res = await fetchWithRetry(url, { headers: getGitHubHeaders() });
+    const data: any = await res.json();
+    return Buffer.from(data.content, "base64").toString("utf8");
+}
+
+function uniqueNodesSort(files: any[]) {
+    files.sort((a, b) => getPriority(b.path) - getPriority(a.path));
+}
+
+// ---------------------------------------------------------------------------
+// Import Analysis Utilities
+// ---------------------------------------------------------------------------
+
+function extractImports(content: string, ext: string): string[] {
+    const imports: string[] = [];
+    if (!content) return [];
+
+    if (['.js', '.ts', '.jsx', '.tsx'].includes(ext)) {
+        const patterns = [
+            /import\s+.*?from\s+['"](.*?)['"]/g,
+            /require\(['"](.*?)['"]\)/g,
+            /from\s+['"](.*?)['"]/g
+        ];
+        for (const p of patterns) {
+            let match;
+            while ((match = p.exec(content)) !== null) {
+                if (match[1]) imports.push(match[1]);
+            }
+        }
+    } else if (ext === '.py') {
+        const patterns = [
+            /from\s+(.*?)\s+import/g,
+            /import\s+(.*)/g
+        ];
+        for (const p of patterns) {
+            let match;
+            while ((match = p.exec(content)) !== null) {
+                if (match[1]) imports.push(match[1].trim());
+            }
+        }
+    } else if (ext === '.java') {
+        const pattern = /import\s+(.*?);/g;
+        let match;
+        while ((match = pattern.exec(content)) !== null) {
+            if (match[1]) imports.push(match[1].trim());
+        }
+    }
+
+    return Array.from(new Set(imports));
+}
+
+function resolveImport(importPath: string, currentFile: string, allFiles: string[]): string | null {
+    if (!importPath.startsWith('.')) return null; // Only relative imports
+
+    const segments = currentFile.split('/');
+    segments.pop(); // Remove filename
+    const base = segments.join('/');
+
+    // 1. Absolute resolution relative to repo root
+    let resolved = (base + '/' + importPath).replace(/\/+/g, '/').replace(/^\//, '');
+    
+    // Normalize path (handle ./ and ../)
+    const parts = resolved.split('/');
+    const stack: string[] = [];
+    for (const p of parts) {
+        if (p === '..') stack.pop();
+        else if (p !== '.') stack.push(p);
+    }
+    resolved = stack.join('/');
+
+    // 2. Try extensions
+    const fallbacks = ['', '.ts', '.js', '.jsx', '.tsx', '/index.ts', '/index.js'];
+    for (const fb of fallbacks) {
+        const trial = resolved + fb;
+        if (allFiles.includes(trial)) return trial;
+    }
+
+    return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -126,22 +275,28 @@ export async function ingest(input: IngestionInput): Promise<IngestionOutput> {
   }
 
   const parsed = parseGitHubUrl(input.repoUrl);
-  if (!parsed) {
-    throw new Error("Invalid GitHub URL format");
-  }
+  if (!parsed) throw new Error("Invalid GitHub URL");
 
-  console.log("REPO INPUT:", input.repoUrl);
-  
-  // 1. Get default branch
   const branch = await getRepoMetadata(parsed.owner, parsed.repo);
-  
-  // 2. Fetch Tree
   const files = await fetchGitHubTree(parsed.owner, parsed.repo, branch);
+  const allFileIds = files.map(f => f.id);
 
-  // 3. Simple Dependency Discovery (Regex based for common patterns)
-  // Since we don't fetch content for all 1500 files (too slow for demo), 
-  // we generate structural edges based on folder and name hints if content isn't available.
   const dependencies: DependencyInput[] = [];
+
+  for (const file of files) {
+    if (!file.content) continue;
+    const imports = extractImports(file.content, file.extension);
+    let edgeCount = 0;
+    
+    for (const imp of imports) {
+        const resolved = resolveImport(imp, file.id, allFileIds);
+        if (resolved && resolved !== file.id) {
+            dependencies.push({ from: file.id, to: resolved });
+            edgeCount++;
+            if (edgeCount >= 3) break; // Strict edge limit per task
+        }
+    }
+  }
 
   return { files, dependencies };
 }
