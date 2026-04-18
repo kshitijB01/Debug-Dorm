@@ -104,6 +104,7 @@ export function buildArchitectureGraph(input: {
 
   // 9. Construct Metadata
   const metadata = {
+    version: "2.0.0-LOCKED",
     totalFiles: input.files.length,
     totalEdges: input.dependencies.length,
     validEdges: edges.length,

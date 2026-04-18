@@ -1,40 +1,46 @@
-import { QueryRequest, QueryResponse, GraphNode } from "../types/graphTypes";
+import { QueryRequest, QueryResponse, AnalysisResult } from "../types/graphTypes";
 import { tokenize } from "../utils/tokenizer";
 
 const WEAK_TOKENS = new Set(["where", "is", "the", "what", "how", "a", "an", "of", "and", "or", "to", "in"]);
 
 /**
  * Handles natural language queries and maps them to graph nodes with intelligent scoring.
+ * Deterministic, type-safe, and standalone.
  */
 export function handleQuery(request: QueryRequest): QueryResponse {
   const { query, context } = request;
-  const nodes = context.graph.nodes;
-  const nodeMap = context.nodeMap;
 
-  // 1. Normalization & Pre-processing
-  const cleanQuery = query.toLowerCase().trim().replace(/[?.!,]/g, "");
-  
-  // 2. Empty Query Handling (Fallback immediately)
-  if (!cleanQuery) {
-    return getFallbackResponse("Showing key files in the repository.", context);
+  // 1. TOP-LEVEL VALIDATION
+  if (!context || !context.nodeMap || Object.keys(context.nodeMap).length === 0) {
+    return getSafeFallbackResponse("Invalid exploration context. Showing base repository structure.", context);
   }
 
-  // 3. Keyword Extraction
+  const nodeMap = context.nodeMap;
+  const searchIndex = context.searchIndex || {};
+  const views = context.views;
+
+  // 2. Normalization & Pre-processing
+  const cleanQuery = query.toLowerCase().trim().replace(/[?.!,]/g, "");
+  
+  // 3. Empty Query Handling
+  if (!cleanQuery) {
+    return getSafeFallbackResponse("Showing key files in the repository.", context);
+  }
+
+  // 4. Keyword Extraction
   const rawTokens = tokenize(cleanQuery);
   const strongTokens = rawTokens.filter(t => t.length >= 3 && !WEAK_TOKENS.has(t));
 
-  // If no strong tokens extracted, trigger fallback
   if (strongTokens.length === 0) {
-    return getFallbackResponse("No specific matches found. Showing general exploration views.", context);
+    return getSafeFallbackResponse("Explore the repository by selecting key components below.", context);
   }
 
-  // Limit search to first 3 strong tokens for precision and performance
+  // 5. Scoring Engine (Strictly using nodeMap)
+  const candidateScores = new Map<string, number>();
   const searchTokens = strongTokens.slice(0, 3);
 
-  // 4. Scoring Engine (O(n))
-  const candidateScores = new Map<string, number>();
-
-  for (const node of nodes) {
+  for (const nodeId in nodeMap) {
+    const node = nodeMap[nodeId];
     const nodeNameLow = node.name.toLowerCase();
     const nodeFolderLow = node.folder.toLowerCase();
     let score = 0;
@@ -57,91 +63,102 @@ export function handleQuery(request: QueryRequest): QueryResponse {
       // Folder match (+2)
       if (nodeFolderLow.includes(token)) {
         score += 2;
-        // Combined Folder + Filename boost (+3)
-        if (tokenMatched) {
-          score += 3;
-        }
+        if (tokenMatched) score += 3; // Focus boost
         tokenMatched = true;
       }
 
       if (tokenMatched) {
         matchFound = true;
-        // Multi-token boost (+2 for each additional unique matching token)
-        score += 2;
+        score += 2; // Multi-token boost
       }
     }
 
     if (matchFound) {
-      // Impact weight (Indisputable tie-breaker/relevance booster)
-      score += node.impact * 0.2;
-      candidateScores.set(node.id, score);
+      // Impact weight
+      score += (node.impact || 0) * 0.2;
+      candidateScores.set(nodeId, score);
     }
   }
 
-  // 5. Result Sorting & Selection
-  const sortedIds = Array.from(candidateScores.keys()).sort((a, b) => {
+  // 6. Result Sorting
+  let sortedIds = Array.from(candidateScores.keys()).sort((a, b) => {
     const scoreA = candidateScores.get(a) || 0;
     const scoreB = candidateScores.get(b) || 0;
-    if (Math.abs(scoreB - scoreA) > 0.001) {
-      return scoreB - scoreA;
-    }
-    // Secondary Tie-breaker: Impact
+    if (Math.abs(scoreB - scoreA) > 0.001) return scoreB - scoreA;
     return (nodeMap[b]?.impact || 0) - (nodeMap[a]?.impact || 0);
   });
 
-  // 6. Hard Fallback if no meaningful matches
-  if (sortedIds.length === 0) {
-    return getFallbackResponse(`No direct match found for '${searchTokens.join(", ")}'. Showing entry points.`, context);
+  // 7. VALIDATE highlightNodes (Patch Hardware)
+  let highlightNodes = sortedIds.slice(0, 5).filter(id => nodeMap[id]);
+
+  if (highlightNodes.length === 0) {
+    return getSafeFallbackResponse(`No direct matches for '${searchTokens.join(", ")}'.`, context);
   }
 
-  // 7. Successful Response Assembly
-  const highlightNodes = sortedIds.slice(0, 5);
+  // 8. FINAL CONSISTENCY CHECK & RESPONSE
   const focusNode = highlightNodes[0];
+  
+  // Guarantee focusNode existence
+  if (!nodeMap[focusNode]) {
+    return getSafeFallbackResponse("Aligning view to repository entry points.", context);
+  }
 
-  // Extract basenames for the answer string
   const relevantFiles = highlightNodes
-    .slice(0, 4) // Max 4 for answer
-    .map(id => id.split("/").pop() || id)
+    .slice(0, 4)
+    .map(id => nodeMap[id].name)
     .join(", ");
 
-  const answer = `The most relevant files for '${query}' are: ${relevantFiles}. These components likely handle this functionality based on their structure and local dependencies.`;
-
-  // Debug Logging
-  if (process.env.DEBUG_QUERY === "true") {
-    console.log(`[DEBUG] Query: ${query}`);
-    console.log(`[DEBUG] Tokens: ${searchTokens}`);
-    console.log(`[DEBUG] Matches Found: ${sortedIds.length}`);
-  }
-
   return {
-    answer,
+    answer: `Relevant files for your query: ${relevantFiles}.`,
     highlightNodes,
     focusNode
   };
 }
 
 /**
- * Generates a consistent fallback response based on repository views.
+ * UPGRADED SAFE FALLBACK CHAIN (MANDATORY)
  */
-function getFallbackResponse(answer: string, context: AnalysisResult): QueryResponse {
-  const views = context.views;
-  
-  // Try Entry Points -> High Impact -> Default
-  let highlightNodes = views.entryPoints.length > 0 ? views.entryPoints.slice(0, 5) :
-                     views.highImpact.length > 0 ? views.highImpact.slice(0, 5) :
-                     views.default.slice(0, 5);
+function getSafeFallbackResponse(answer: string, context: AnalysisResult): QueryResponse {
+  const nodeMap = context?.nodeMap || {};
+  const views = context?.views || { entryPoints: [], highImpact: [], default: [], byFolder: {} };
 
-  // Absolute fallback to first node if everything else fails
-  if (highlightNodes.length === 0 && context.graph.nodes.length > 0) {
-    highlightNodes = [context.graph.nodes[0].id];
+  const checkValidity = (ids: string[]) => ids.filter(id => nodeMap[id]);
+
+  // 1. Entry Points
+  let fallback = checkValidity(views.entryPoints || []);
+  
+  // 2. High Impact
+  if (fallback.length === 0) {
+    fallback = checkValidity(views.highImpact || []);
+  }
+
+  // 3. Default View
+  if (fallback.length === 0) {
+    fallback = checkValidity(views.default || []);
+  }
+
+  // 4. Object.keys(nodeMap)
+  if (fallback.length === 0) {
+    fallback = Object.keys(nodeMap).slice(0, 3);
+  }
+
+  const highlightNodes = fallback.length > 0 ? fallback.slice(0, 5) : [];
+  const focusNode = highlightNodes[0] || Object.keys(nodeMap)[0] || "";
+
+  // Validate one last time for the response guarantee
+  if (highlightNodes.length === 0 || !focusNode || !nodeMap[focusNode]) {
+    // This should theoretically be impossible if nodeMap has keys
+    const firstKey = Object.keys(nodeMap)[0] || "";
+    return {
+      answer: answer || "Exploring codebase architecture.",
+      highlightNodes: firstKey ? [firstKey] : [],
+      focusNode: firstKey
+    };
   }
 
   return {
-    answer,
+    answer: answer || "Showing base repository exploration.",
     highlightNodes,
-    focusNode: highlightNodes[0] || ""
+    focusNode
   };
 }
-
-// Support functions/types if needed, but AnalysisResult handles it
-import { AnalysisResult } from "../types/graphTypes";

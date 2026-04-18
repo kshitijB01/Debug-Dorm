@@ -55,6 +55,7 @@ export type AnalysisResult = {
   searchIndex: Record<string, string[]>;
   queryContext: QueryContext;
   metadata: {
+    version: string;
     totalFiles: number;
     totalEdges: number;
     validEdges: number;
@@ -62,6 +63,7 @@ export type AnalysisResult = {
     payloadSize: number;
   };
 };
+
 export type QueryRequest = {
   query: string;
   context: AnalysisResult;

@@ -1,12 +1,16 @@
 import { Router, Request, Response } from "express";
 import { analyzeRepository } from "../ingestion/orchestrator";
 import { handleQuery } from "../ai/queryHandler";
+import { generateChatResponse, preWarmCache } from "../ai/openaiService";
 
 const router = Router();
 
+// 1. GLOBAL STATE for Rate Limiting
+let lastQueryTimestamp = 0;
+const RATE_LIMIT_MS = 300;
+
 // ---------------------------------------------------------------------------
 // POST /api/analyze
-// Accepts: { repoUrl?: string, mockId?: string }
 // Returns: AnalysisResult
 // ---------------------------------------------------------------------------
 router.post("/analyze", (req: Request, res: Response) => {
@@ -14,57 +18,106 @@ router.post("/analyze", (req: Request, res: Response) => {
     const { repoUrl, mockId } = req.body;
 
     if (!repoUrl && !mockId) {
-      return res.status(400).json({
-        error: "Missing required field: provide repoUrl or mockId"
-      });
+      return res.status(400).json({ error: "Missing required field: provide repoUrl or mockId" });
     }
 
     const result = analyzeRepository({ repoUrl, mockId });
-    return res.status(200).json(result);
 
+    // PRE-WARM CACHE (Background)
+    preWarmCache(result).catch(() => {});
+
+    return res.status(200).json(result);
   } catch (error) {
     console.error("[/analyze] Exception:", error);
-
-    // Canonical empty fallback — never crash the client
     return res.status(200).json({
       graph: { nodes: [], edges: [] },
       views: { default: [], highImpact: [], entryPoints: [], byFolder: {} },
       nodeMap: {},
       searchIndex: {},
       queryContext: { topNodes: [], entryPoints: [], nodeMap: {} },
-      metadata: {
-        totalFiles: 0,
-        totalEdges: 0,
-        validEdges: 0,
-        isLargeGraph: false,
-        payloadSize: 0
-      }
+      metadata: { version: "1.0.0-fallback", totalFiles: 0, totalEdges: 0, validEdges: 0, isLargeGraph: false, payloadSize: 0 }
     });
   }
 });
 
-router.post("/query", (req: Request, res: Response) => {
+// ---------------------------------------------------------------------------
+// POST /api/query
+// Returns: QueryResponse
+// ---------------------------------------------------------------------------
+router.post("/query", async (req: Request, res: Response) => {
+  const { query, context } = req.body;
+  const userQuery = (query || "").trim();
+  console.log("QUERY RECEIVED:", userQuery);
+
   try {
-    const { query, context } = req.body;
-    
-    if (!context || !context.graph) {
-        return res.status(400).json({ error: "Context missing or invalid" });
+    // 1. Context validation
+    if (!context || !context.nodeMap) {
+      return res.status(400).json({ error: "Analysis context missing or invalid" });
     }
 
-    const response = handleQuery({ query: query || "", context });
-    return res.status(200).json(response);
-  } catch (error) {
-    console.error("Query Exception:", error);
+    // 2. Deterministic Result (Always needed for nodes)
+    const deterministicResult = handleQuery({ query: userQuery, context });
+
+    // 3. RATE LIMITING
+    const now = Date.now();
+    if (now - lastQueryTimestamp < RATE_LIMIT_MS) {
+      return res.status(200).json(deterministicResult);
+    }
+    lastQueryTimestamp = now;
+
+    // 4. QUERY INTELLIGENCE (Upgraded Intent Detection)
+    const normalizedQuery = userQuery.toLowerCase();
+    const aiKeywords = ["explain", "summary", "summarize", "what", "how", "why", "overview", "describe", "purpose"];
+    
+    let needsAI = aiKeywords.some(keyword => normalizedQuery.includes(keyword)) || 
+                  userQuery.split(" ").length > 2; // Treat 3+ words as AI query
+    
+    const isShort = userQuery.length < 3;
+
+    if (!needsAI || isShort) {
+      return res.status(200).json(deterministicResult);
+    }
+
+    // 5. TIMEOUT RACER
+    const timeoutPromise = new Promise<null>((_, reject) => 
+      setTimeout(() => reject(new Error("timeout")), 2000)
+    );
+
+    try {
+      const aiAnswer = await Promise.race([
+        generateChatResponse(userQuery, context),
+        timeoutPromise
+      ]);
+
+      if (aiAnswer) {
+        return res.status(200).json({
+          ...deterministicResult,
+          answer: aiAnswer
+        });
+      }
+    } catch (error) {
+      // Silence internal errors in production, fallback below
+    }
+
+    // Final Fallback if AI fails or times out
     return res.status(200).json({
-        answer: "I encountered an error while processing your query. Showing general exploration views.",
-        highlightNodes: [],
-        focusNode: ""
+      ...deterministicResult,
+      answer: "Here are the key parts of the repository to explore."
+    });
+
+  } catch (error) {
+    console.error("Query Execution Exception:", error);
+    const fallbackNodes = Object.keys(context?.nodeMap || {}).slice(0, 3);
+    return res.status(200).json({
+      answer: "Here are the key parts of the repository to explore.",
+      highlightNodes: fallbackNodes,
+      focusNode: fallbackNodes[0] || ""
     });
   }
 });
 
 router.get("/health", (req: Request, res: Response) => {
-  res.status(200).json({ status: "OK" });
+  res.status(200).json({ status: "OK", timestamp: new Date().toISOString() });
 });
 
 export default router;
